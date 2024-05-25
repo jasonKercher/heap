@@ -4,9 +4,6 @@ import "core:sys/linux"
 import "core:sync"
 import "core:mem"
 
-/* TODO: REMOVE */
-import "core:fmt"
-
 PAGE_SIZE :: 4096
 
 CHUNKS_PER_MAP_CELL   :: size_of(Map_Cell) * 8 / 2
@@ -141,13 +138,3 @@ _chunk_find_fit :: proc(chunk_map: []Map_Cell, map_end: int, size: int, align: i
 
 	}
 }
-
-main :: proc() {
-	ptr := heap_alloc(50)
-	ptr2 := heap_alloc(42)
-
-	context.allocator = { procedure = _page_allocator_proc }
-	efficiency := new(u8)
-	fmt.printf("%v %v %v\n", ptr, ptr2, efficiency)
-}
-

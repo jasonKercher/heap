@@ -20,17 +20,22 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int, old_ptr: rawptr = ni
 	 *       take a stab at huge pages if > 2MB.
 	 */
 	flags := MMAP_FLAGS
-	if size > 1 * mem.Gigabyte {
+	if size >= 1 * mem.Gigabyte || alignment >= 1 * mem.Gigabyte {
 		raw_flags := transmute(i32)(flags) | linux.MAP_HUGE_1GB
 		flags = transmute(linux.Map_Flags)(raw_flags)
 		flags += {.HUGETLB}
-	} else if size > 2 * mem.Megabyte {
+	} else if size >= 2 * mem.Megabyte || alignment >= 2 * mem.Megabyte {
 		raw_flags := transmute(i32)(flags) | linux.MAP_HUGE_2MB
 		flags = transmute(linux.Map_Flags)(raw_flags)
 		flags += {.HUGETLB}
 	}
 
 	ptr, mmap_err := linux.mmap(0, uint(size), MMAP_PROT, flags)
+	// failed huge pages ENOMEM, try again without it.
+	if mmap_err == .ENOMEM {
+		ptr, mmap_err = linux.mmap(0, uint(size), MMAP_PROT, MMAP_FLAGS)
+	}
+
 	if mmap_err != nil || ptr == nil {
 		return nil, .Out_Of_Memory
 	}
