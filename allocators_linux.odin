@@ -9,7 +9,7 @@ MMAP_PROT    : linux.Mem_Protection : {.READ, .WRITE}
 
 Page_Allocator :: runtime.Allocator
 Page_Allocator_Config_Bits :: enum {
-	Unmovable_Buffers,
+	Unmovable_Pages,
 }
 Page_Allocator_Config :: bit_set[Page_Allocator_Config_Bits; uintptr]
 
@@ -20,6 +20,14 @@ _page_allocator_get_config :: proc(allocator_data: rawptr) -> Page_Allocator_Con
 
 _page_allocator_set_config :: proc(allocator_data: ^rawptr, config: Page_Allocator_Config) {
 	allocator_data^ = transmute(rawptr)(config)
+}
+
+_page_allocator_make :: proc(config: Page_Allocator_Config = {}) -> Page_Allocator {
+	a : Page_Allocator = {
+		procedure = _page_allocator_proc
+	}
+	_page_allocator_set_config(&a.data, config)
+	return a
 }
 
 _page_allocator_aligned_alloc :: proc(size, alignment: int, old_ptr: rawptr = nil) -> ([]byte, mem.Allocator_Error) {
@@ -97,9 +105,13 @@ _page_allocator_proc :: proc(allocator_data: rawptr, mode: mem.Allocator_Mode,
 	case .Free_All:
 		return nil, .Mode_Not_Implemented
 
+	case .Resize:
+		break
+
 	case .Resize_Non_Zeroed:
 		zero_memory = false;
-	case .Resize:
+		break
+
 	case .Query_Features:
 		set := (^mem.Allocator_Mode_Set)(old_memory)
 		if set != nil {
@@ -120,7 +132,7 @@ _page_allocator_proc :: proc(allocator_data: rawptr, mode: mem.Allocator_Mode,
 		return nil, nil
 	}
 
-	may_move := .Unmovable_Buffers not_in _page_allocator_get_config(allocator_data)
+	may_move := .Unmovable_Pages not_in _page_allocator_get_config(allocator_data)
 	return _page_allocator_aligned_resize(old_memory, old_size, size, alignment, zero_memory, may_move)
 }
 
