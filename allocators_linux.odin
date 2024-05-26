@@ -61,7 +61,7 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 	ptr, errno := linux.mmap(0, uint(mapping_size), MMAP_PROT, flags)
 
 	// failed huge pages ENOMEM, try again without it.
-	if errno == .ENOMEM {
+	if errno == .ENOMEM && .HUGETLB in flags {
 		ptr, errno = linux.mmap(0, uint(mapping_size), MMAP_PROT, MMAP_FLAGS)
 	}
 	if errno != nil || ptr == nil {
@@ -73,12 +73,14 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 	if aligned_size != mapping_size {
 		i := 0
 		N :: ((PAGE_ALLOCATOR_MAX_ALIGNMENT - PAGE_SIZE) / PAGE_SIZE)
-		for ; i < N  && !_is_max_aligned(ptr); i += 1 { }
 
-		if i != 0 {
-			linux.munmap(ptr, PAGE_SIZE * uint(i))
+		p := mem.align_forward_uintptr(uintptr(ptr), PAGE_ALLOCATOR_MAX_ALIGNMENT)
+
+		waste := p - uintptr(ptr)
+		if waste > 0 {
+			linux.munmap(ptr, uint(waste))
 		}
-		ptr = mem.ptr_offset(&ptr, PAGE_SIZE * uint(i))
+		ptr = rawptr(p)
 	}
 
 	return mem.byte_slice(ptr, size), nil
@@ -130,7 +132,7 @@ _page_allocator_aligned_resize :: proc(old_ptr: rawptr,
 		mem.copy_non_overlapping(&new_bytes[0], old_ptr, old_size)
 		linux.munmap(old_ptr, mem.align_forward_uint(uint(old_size), PAGE_SIZE))
 
-		return mem.byte_slice(&new_bytes[0], new_size), nil
+		return new_bytes[:new_size], nil
 	}
 
 	new_ptr, errno = linux.mremap(old_ptr,

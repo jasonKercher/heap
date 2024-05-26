@@ -26,7 +26,14 @@ _check_page_allocator :: proc() {
 	fmt.printf("32:%p ", ptr)
 	ptr, err = runtime.new_aligned(int, 64 * mem.Kilobyte)
 	fmt.printf("64:%p ", ptr)
+	
+	fmt.printf("\n")
 
-	fmt.printf(" . \n")
+	ptr, err = runtime.new_aligned(int, 8 * mem.Megabyte)
+	fmt.printf("8M:%p ", ptr)
+	ptr, err = runtime.new_aligned(int, 2 * mem.Gigabyte)
+	fmt.printf("2G:%p ", ptr)
+
+	fmt.printf("\n")
 }
 
