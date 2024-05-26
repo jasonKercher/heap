@@ -36,9 +36,8 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int, old_ptr: rawptr = ni
 	}
 	size := int(uintptr(mem.align_forward(rawptr(uintptr(size)), 4096)))
 
-	// NOTE: No guarantees of alignment over 4K, but we will
+	// NOTE: No guarantees of alignment, but we will
 	//       take a stab at huge pages if > 2MB.
-	//
 	flags := MMAP_FLAGS
 	if size >= 1 * mem.Gigabyte || alignment >= 1 * mem.Gigabyte {
 		raw_flags := transmute(i32)(flags) | linux.MAP_HUGE_1GB
@@ -67,7 +66,6 @@ _page_allocator_aligned_resize :: proc(p: rawptr,
 	                               old_size, new_size, new_align: int,
 				       zero_memory, allow_move: bool) -> (new_memory: []byte, err: mem.Allocator_Error) {
 	if new_align > PAGE_SIZE {
-		unimplemented()
 	}
 	if p == nil {
 		return nil, nil

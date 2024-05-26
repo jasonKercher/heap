@@ -25,7 +25,7 @@ PAGES_MAX_ALLOC :: 16 * mem.Megabyte
 //                     |
 // >= PAGES_MAX_ALLOC  | Independent: Individual mappings at this piont. Huge pages?
 
-heap_alloc :: proc(size: int, alignment: int = size_of(Chunk16), zero_memory: bool = true) -> rawptr {
+heap_alloc :: proc(size: int, alignment: int = size_of(Region_Chunk), zero_memory: bool = true) -> rawptr {
 	if size <= REGION_MAX_ALLOC {
 		return _region_alloc(size, alignment, zero_memory)
 	}
@@ -35,7 +35,7 @@ heap_alloc :: proc(size: int, alignment: int = size_of(Chunk16), zero_memory: bo
 	return _independent_alloc(size, alignment, zero_memory)
 }
 
-heap_resize :: proc(old_memory: rawptr, new_size: int, new_alignment: int = size_of(Chunk16), zero_memory: bool = true) -> rawptr {
+heap_resize :: proc(old_memory: rawptr, new_size: int, new_alignment: int = size_of(Region_Chunk), zero_memory: bool = true) -> rawptr {
 	if old_memory == nil {
 		return heap_alloc(new_size, new_alignment, zero_memory)
 	}
@@ -75,28 +75,28 @@ heap_free :: proc(memory: rawptr) {
 // impl
 
 CHUNKS_PER_MAP_CELL   :: size_of(Map_Cell) * 8 / 2
-MAP_CELLS_PER_REGION  :: PAGE_SIZE / size_of(Chunk16) / CHUNKS_PER_MAP_CELL
+MAP_CELLS_PER_REGION  :: PAGE_SIZE / size_of(Region_Chunk) / CHUNKS_PER_MAP_CELL
+
+REGION_CHUNK_COUNT    :: REGION_BYTES_PER_PAGE / size_of(Region_Chunk)
 REGION_BYTES_PER_PAGE :: (PAGE_SIZE - size_of(Region_Header))
-CHUNK16_PER_REGION    :: REGION_BYTES_PER_PAGE / size_of(Chunk16)
 
 Region_Header :: struct #align(16) {
 	chunk_map:         [MAP_CELLS_PER_REGION]Map_Cell,
-	in_use:            u16,
-	max_align:         u16,
-	map_end:           u16,
-	max_map_end:       u16, // no zeroing beyond here necessary
-	atomic_own:        int,
-	base_addr:         rawptr,
+	in_use:            u8,
+	max_align:         u8,
+	map_in_use_end:    u8,
+	max_map_end:       u8, // no zeroing beyond here necessary
+	_:                 u32,
 	local_region_addr: rawptr,
 }
 #assert(offset_of(Region_Header, in_use) == 64)
 DEFAULT_REGION_HEADER : Region_Header : {
-	max_align = REGION_MAX_ALIGN,
+	max_align = REGION_MAX_ALIGN / size_of(Region_Chunk)
 }
 
 Region :: struct {
 	header: Region_Header,
-	chunks: [CHUNK16_PER_REGION]Chunk16,  // User Data
+	chunks: [REGION_CHUNK_COUNT]Region_Chunk,  // User Data
 }
 #assert(size_of(Region) == PAGE_SIZE)
 
@@ -113,14 +113,14 @@ Cell_State :: enum i8 {
 }
 #assert(int(max(Cell_State)) < 4) // 2 bit state
 
-Map_Cell :: u64
-Chunk16  :: [16]u8
+Map_Cell     :: u64
+Region_Chunk :: [16]u8
 
 // Regions are stored linearly in multiple buffers
 // using the page_allocator that has been configured
 // to not allow the data to move. When we fail to
 // resize, just start a new buffer.
-_region_list: [dynamic][]Region
+_region_list      : [dynamic][]Region
 _region_list_mutex: sync.Mutex
 
 REGION_IN_USE :: rawptr(~uintptr(0))
@@ -153,9 +153,19 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 			if success = _region_aquire_try(&list[i].header.local_region_addr); !success {
 				continue
 			}
+			if size > (REGION_CHUNK_COUNT - int(list[i].header.map_in_use_end)) ||
+			   align > int(list[i].header.max_align) {
+				continue
+			}
+
+			/* TODO: Try to FIT IT !!! */
 		}
+
 		return /* TODO */
 	}
+
+	size  := max(size / size_of(Region_Chunk), 1)
+	align := max(align / size_of(Region_Chunk), 1)
 
 	if _region_list == nil {
 		sync.mutex_lock(&_region_list_mutex)
@@ -170,14 +180,14 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 			external_allocator := _page_allocator_make({.Unmovable_Pages})
 			_region_list[0], err = make([]Region, 16, external_allocator)
 			_region_list[0][0].header = DEFAULT_REGION_HEADER
-
 		}
 	}
 
 	if _local_region == nil { _local_region = &_region_list[0][0] }
 
 	success := _region_aquire_try(&_local_region.header.local_region_addr)
-	for !success {
+	/* TODO: check if space */
+	for ; !success; {
 		// region stolen by another thread; find new one
 		success = region_list_find_fit(size, align)
 	}
@@ -185,7 +195,10 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 	return nil
 }
 
-_region_resize :: proc(old_memory: rawptr, new_size, align: int, zero_memory: bool) -> rawptr {
+_region_resize :: proc(old_memory: rawptr, size, align: int, zero_memory: bool) -> rawptr {
+	size  := max(size / size_of(Region_Chunk), 1)
+	align := max(align / size_of(Region_Chunk), 1)
+
 	return nil
 }
 
