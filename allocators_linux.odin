@@ -24,7 +24,7 @@ _page_allocator_set_config :: proc(allocator_data: ^rawptr, config: Page_Allocat
 	allocator_data^ = transmute(rawptr)(config)
 }
 
-_page_allocator_make :: proc(config: Page_Allocator_Config = {}) -> Page_Allocator {
+_page_allocator :: proc(config: Page_Allocator_Config = {}) -> Page_Allocator {
 	a : Page_Allocator = {
 		procedure = _page_allocator_proc
 	}
@@ -74,7 +74,6 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 		i := 0
 		N :: ((PAGE_ALLOCATOR_MAX_ALIGNMENT - PAGE_SIZE) / PAGE_SIZE)
 		for ; i < N  && !_is_max_aligned(ptr); i += 1 { }
-		assert(i != N)
 
 		if i != 0 {
 			linux.munmap(ptr, PAGE_SIZE * uint(i))
@@ -90,6 +89,9 @@ _page_allocator_aligned_resize :: proc(old_ptr: rawptr,
 				       zero_memory, allow_move: bool) -> (new_memory: []byte, err: mem.Allocator_Error) {
 	if old_ptr == nil {
 		return nil, nil
+	}
+	if !_is_page_aligned(old_ptr) {
+		return nil, .Invalid_Pointer
 	}
 	new_ptr: rawptr
 

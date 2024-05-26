@@ -172,12 +172,12 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 		defer sync.mutex_unlock(&_region_list_mutex)
 
 		if _region_list == nil {
-			internal_allocator := _page_allocator_make()
+			internal_allocator := _page_allocator()
 			err: mem.Allocator_Error
 			_region_list, err = make([dynamic][]Region, 1, PAGE_SIZE / size_of(_region_list[0]), internal_allocator)
 			assert(err == nil)
 
-			external_allocator := _page_allocator_make({.Unmovable_Pages})
+			external_allocator := _page_allocator({.Unmovable_Pages})
 			_region_list[0], err = make([]Region, 16, external_allocator)
 			_region_list[0][0].header = DEFAULT_REGION_HEADER
 		}
