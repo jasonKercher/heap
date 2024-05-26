@@ -11,6 +11,8 @@ PAGE_ALLOCATOR_MAX_ALIGNMENT :: 64 * mem.Kilobyte
 
 /* TODO: REMOVE */
 g_last_was_huge: bool
+g_tail_waste: int
+g_head_waste: int
 
 Page_Allocator :: runtime.Allocator
 Page_Allocator_Config_Bits :: enum {
@@ -58,6 +60,8 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 		flags += {.HUGETLB}
 		if ptr, errno := linux.mmap(0, uint(aligned_size), MMAP_PROT, flags); ptr != nil && errno == nil {
 			g_last_was_huge = true
+			g_head_waste = 0
+			g_tail_waste = 0
 			return mem.byte_slice(ptr, size), nil
 		}
 	}
@@ -68,6 +72,8 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 		flags += {.HUGETLB}
 		if ptr, errno := linux.mmap(0, uint(aligned_size), MMAP_PROT, flags); ptr != nil && errno == nil {
 			g_last_was_huge = true
+			g_head_waste = 0
+			g_tail_waste = 0
 			return mem.byte_slice(ptr, size), nil
 		}
 	}
@@ -80,13 +86,17 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allo
 	// If these don't match, we added extra for alignment.
 	// Find the correct alignment, and unmap the waste.
 	if aligned_size != mapping_size {
-		p := mem.align_forward_uintptr(uintptr(ptr), uintptr(aligned_alignment))
+		aligned_ptr := mem.align_forward_uintptr(uintptr(ptr), uintptr(aligned_alignment))
 
-		waste := p - uintptr(ptr)
-		if waste > 0 {
-			linux.munmap(ptr, uint(waste))
+		g_head_waste = int(aligned_ptr - uintptr(ptr))
+		g_tail_waste = (aligned_alignment - PAGE_SIZE) - g_head_waste
+		if g_head_waste > 0 {
+			linux.munmap(ptr, uint(g_head_waste))
 		}
-		ptr = rawptr(p)
+		if g_tail_waste > 0 {
+			linux.munmap(rawptr(aligned_ptr + uintptr(aligned_size)), uint(g_tail_waste))
+		}
+		ptr = rawptr(aligned_ptr)
 	}
 	return mem.byte_slice(ptr, size), nil
 }
