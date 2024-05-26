@@ -7,6 +7,8 @@ import "core:sys/linux"
 MMAP_FLAGS   : linux.Map_Flags      : {.ANONYMOUS, .PRIVATE}
 MMAP_PROT    : linux.Mem_Protection : {.READ, .WRITE}
 
+PAGE_ALLOCATOR_MAX_ALIGNMENT :: 64 * mem.Kilobyte
+
 Page_Allocator :: runtime.Allocator
 Page_Allocator_Config_Bits :: enum {
 	Unmovable_Pages,
@@ -30,56 +32,113 @@ _page_allocator_make :: proc(config: Page_Allocator_Config = {}) -> Page_Allocat
 	return a
 }
 
-_page_allocator_aligned_alloc :: proc(size, alignment: int, old_ptr: rawptr = nil) -> ([]byte, mem.Allocator_Error) {
+_page_allocator_aligned_alloc :: proc(size, alignment: int) -> ([]byte, mem.Allocator_Error) {
 	if size == 0 {
 		return nil, .Invalid_Argument
 	}
-	size := int(uintptr(mem.align_forward(rawptr(uintptr(size)), 4096)))
+	aligned_size      := mem.align_forward_int(size, PAGE_SIZE)
+	aligned_alignment := mem.align_forward_int(alignment, PAGE_SIZE)
 
-	// NOTE: No guarantees of alignment, but we will
-	//       take a stab at huge pages if > 2MB.
+	mapping_size := aligned_size
+
+	has_waste: bool
+	if alignment > PAGE_SIZE {
+		// Add extra pages
+		mapping_size += PAGE_ALLOCATOR_MAX_ALIGNMENT - PAGE_SIZE
+	}
+
 	flags := MMAP_FLAGS
-	if size >= 1 * mem.Gigabyte || alignment >= 1 * mem.Gigabyte {
+	if aligned_size >= 1 * mem.Gigabyte || alignment >= 1 * mem.Gigabyte {
 		raw_flags := transmute(i32)(flags) | linux.MAP_HUGE_1GB
 		flags = transmute(linux.Map_Flags)(raw_flags)
-		flags += {.HUGETLB}
-	} else if size >= 2 * mem.Megabyte || alignment >= 2 * mem.Megabyte {
+		//flags += {.HUGETLB}
+	} else if aligned_size >= 2 * mem.Megabyte || alignment >= 2 * mem.Megabyte {
 		raw_flags := transmute(i32)(flags) | linux.MAP_HUGE_2MB
 		flags = transmute(linux.Map_Flags)(raw_flags)
-		flags += {.HUGETLB}
+		//flags += {.HUGETLB}
 	}
 
-	ptr, mmap_err := linux.mmap(0, uint(size), MMAP_PROT, flags)
+	ptr, errno := linux.mmap(0, uint(mapping_size), MMAP_PROT, flags)
 
 	// failed huge pages ENOMEM, try again without it.
-	if mmap_err == .ENOMEM {
-		ptr, mmap_err = linux.mmap(0, uint(size), MMAP_PROT, MMAP_FLAGS)
+	if errno == .ENOMEM {
+		ptr, errno = linux.mmap(0, uint(mapping_size), MMAP_PROT, MMAP_FLAGS)
 	}
-
-	if mmap_err != nil || ptr == nil {
+	if errno != nil || ptr == nil {
 		return nil, .Out_Of_Memory
 	}
+
+	// If these don't match, we added extra for alignment.
+	// Find the correct alignment, and unmap the waste.
+	if aligned_size != mapping_size {
+		i := 0
+		N :: ((PAGE_ALLOCATOR_MAX_ALIGNMENT - PAGE_SIZE) / PAGE_SIZE)
+		for ; i < N  && !_is_max_aligned(ptr); i += 1 { }
+		assert(i != N)
+
+		if i != 0 {
+			linux.munmap(ptr, PAGE_SIZE * uint(i))
+		}
+		ptr = mem.ptr_offset(&ptr, PAGE_SIZE * uint(i))
+	}
+
 	return mem.byte_slice(ptr, size), nil
 }
 
-_page_allocator_aligned_resize :: proc(p: rawptr,
+_page_allocator_aligned_resize :: proc(old_ptr: rawptr,
 	                               old_size, new_size, new_align: int,
 				       zero_memory, allow_move: bool) -> (new_memory: []byte, err: mem.Allocator_Error) {
-	if new_align > PAGE_SIZE {
-	}
-	if p == nil {
+	if old_ptr == nil {
 		return nil, nil
 	}
+	new_ptr: rawptr
 
-	flags: linux.MRemap_Flags = {}
-	if allow_move {
-		flags += {.MAYMOVE}
+	new_align := new_align
+
+	aligned_size      := mem.align_forward_int(new_size, PAGE_SIZE)
+	aligned_alignment := mem.align_forward_int(new_align, PAGE_SIZE)
+
+	// If we meet all our alignment requirements or we're not allowed to move,
+	// we may be able to get away with doing nothing at all or growing in place.
+	errno: linux.Errno
+	if !allow_move || ((uintptr(aligned_alignment) - 1) & uintptr(old_ptr)) == 0 {
+		if aligned_size == mem.align_forward_int(old_size, PAGE_SIZE) {
+			return mem.byte_slice(old_ptr, old_size), nil
+		}
+
+		new_ptr, errno = linux.mremap(old_ptr, uint(old_size) , uint(new_size), {.FIXED})
+		if new_ptr != nil && errno == nil {
+			return mem.byte_slice(new_ptr, new_size), nil
+		}
+		if !allow_move {
+			return mem.byte_slice(old_ptr, old_size), .Out_Of_Memory
+		}
 	}
-	ptr, mremap_err := linux.mremap(p, uint(old_size) , uint(new_size), flags)
-	if ptr == nil || mremap_err != nil {
+
+	// If you want greater than page size alignment, send to aligned_alloc,
+	// manually copy the conents, and unmap the old mapping.
+	if aligned_alignment > PAGE_SIZE {
+		new_bytes: []u8
+		new_align      = mem.align_forward_int(new_align, PAGE_ALLOCATOR_MAX_ALIGNMENT)
+		new_bytes, err = _page_allocator_aligned_alloc(new_size, new_align)
+		if new_bytes == nil || err != nil {
+			return mem.byte_slice(old_ptr, old_size), err == nil ? .Out_Of_Memory : err
+		}
+
+		mem.copy_non_overlapping(&new_bytes[0], old_ptr, old_size)
+		linux.munmap(old_ptr, mem.align_forward_uint(uint(old_size), PAGE_SIZE))
+
+		return mem.byte_slice(&new_bytes[0], new_size), nil
+	}
+
+	new_ptr, errno = linux.mremap(old_ptr,
+	                              mem.align_forward_uint(uint(old_size), PAGE_SIZE),
+	                              uint(aligned_size),
+	                              {.MAYMOVE})
+	if new_ptr == nil || errno != nil {
 		return nil, .Out_Of_Memory
 	}
-	return mem.byte_slice(ptr, new_size), nil
+	return mem.byte_slice(new_ptr, new_size), nil
 }
 
 _page_allocator_free :: proc(p: rawptr, size: int) {
@@ -197,7 +256,11 @@ _heap_allocator_proc :: proc(allocator_data: rawptr, mode: mem.Allocator_Mode,
 	return nil, nil
 }
 
-_is_page_aligned :: proc(p: rawptr) -> bool {
-	return (uintptr(p) & ((1 << 12) - 1)) == 0
+_is_page_aligned :: #force_inline proc(p: rawptr) -> bool {
+	return (uintptr(p) & (PAGE_SIZE - 1)) == 0
+}
+
+_is_max_aligned :: #force_inline proc(p: rawptr) -> bool {
+	return (uintptr(p) & (PAGE_ALLOCATOR_MAX_ALIGNMENT - 1)) == 0
 }
 
