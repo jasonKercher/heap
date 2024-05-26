@@ -1,9 +1,7 @@
 package heap
 
-import "base:runtime"
 import "core:mem"
 import "core:sync"
-import "core:sys/linux"
 
 // general purpose heap allocator
 
@@ -164,8 +162,8 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 		return /* TODO */
 	}
 
-	size  := max(size / size_of(Region_Chunk), 1)
-	align := max(align / size_of(Region_Chunk), 1)
+	chunk_size  := max(size / size_of(Region_Chunk), 1)
+	chunk_align := max(align / size_of(Region_Chunk), 1)
 
 	if _region_list == nil {
 		sync.mutex_lock(&_region_list_mutex)
@@ -189,15 +187,15 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 	/* TODO: check if space */
 	for ; !success; {
 		// region stolen by another thread; find new one
-		success = region_list_find_fit(size, align)
+		success = region_list_find_fit(chunk_size, chunk_align)
 	}
 
 	return nil
 }
 
 _region_resize :: proc(old_memory: rawptr, size, align: int, zero_memory: bool) -> rawptr {
-	size  := max(size / size_of(Region_Chunk), 1)
-	align := max(align / size_of(Region_Chunk), 1)
+	//chunk_size  := max(size / size_of(Region_Chunk), 1)
+	//chunk_align := max(align / size_of(Region_Chunk), 1)
 
 	return nil
 }
