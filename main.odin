@@ -11,32 +11,38 @@ main :: proc() {
 
 _run_new :: proc(alignment: int) {
 	ptr, err := runtime.new_aligned(int, alignment)
-	assert(err == nil)
+	fmt.assertf(err == nil, "%v: ", err)
+	defer free(ptr)
 
-	if g_last_was_huge {
-		fmt.printf("%16x|%9d|%9d|%p # 2MB pages\n", alignment, g_tail_waste, g_head_waste, ptr)
+	if mem.g_last_was_large {
+		fmt.printf("%16x|%12x|%12x|%p # large pages\n", alignment, mem.g_tail_waste, mem.g_head_waste, ptr)
 	} else {
-		fmt.printf("%16x|%9d|%9d|%p\n", alignment, g_tail_waste, g_head_waste, ptr)
+		fmt.printf("%16x|%12x|%12x|%p\n", alignment, mem.g_tail_waste, mem.g_head_waste, ptr)
 	}
+
 }
 
 _check_page_allocator :: proc() {
-	context.allocator = _page_allocator()
+	context.allocator = mem.page_allocator()
 
 	ptr, _ := new(int)
-	fmt.printf(" Align Request  | Tail    | Head    | Address\n")
-	fmt.printf("----------------|---------|---------|--------\n")
-	fmt.printf("align_of(int)   | ????    | ????    |%p\n", ptr)
+	fmt.printf(" Align Request  | Tail       | Head       | Address\n")
+	fmt.printf("----------------|------------|------------|-------------\n")
+	fmt.printf("align_of(int)   | ????       | ????       |%p\n", ptr)
 	
 	_run_new(1   * mem.Kilobyte)
 	_run_new(2   * mem.Kilobyte)
 	_run_new(4   * mem.Kilobyte)
 	_run_new(8   * mem.Kilobyte)
+	_run_new(16  * mem.Kilobyte)
+	_run_new(32  * mem.Kilobyte)
 	_run_new(64  * mem.Kilobyte)
 	_run_new(256 * mem.Kilobyte)
 	_run_new(1   * mem.Megabyte)
 	_run_new(8   * mem.Megabyte)
 	_run_new(128 * mem.Megabyte)
+	_run_new(8   * mem.Gigabyte)
+	_run_new(32  * mem.Gigabyte)
 
 	fmt.printf("\n")
 }
