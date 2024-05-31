@@ -11,17 +11,19 @@ PAGE_SIZE :: 4096
 REGION_MAX_ALIGN :: PAGE_SIZE / 2
 REGION_MAX_ALLOC :: REGION_MAX_ALIGN
 
-PAGES_MAX_ALIGN :: PAGES_MAX_ALLOC / 2
-PAGES_MAX_ALLOC :: 16 * mem.Megabyte
+PAGES_MAX_ALIGN :: 1 * mem.Megabyte
+PAGES_MAX_ALLOC :: 1 * mem.Megabyte
 
-// Range               | Location
-// --------------------|-----------------
-// <= REGION_MAX_ALLOC | Region: A single page that is subdivided for smaller allocations.
-//                     |
-// <  PAGES_MAX_ALLOC  | Pages: Arrays of pages. Main purpose is to reduce the number of
-//                     |        individual memory mappings. Some systems default to 65535.
-//                     |
-// >= PAGES_MAX_ALLOC  | Independent: Individual mappings at this piont. Huge pages?
+INDEPENDENT_MIN_ALIGN :: 2 * mem.Megabyte
+
+// Lookup Alignment    | Allocation Range    | Location
+// --------------------| --------------------|-----------------
+// < page aligned      | <= REGION_MAX_ALLOC | Region: A 4K page subdivided for small allocations
+//                     |                     |
+// page aligned &&     | <  PAGES_MAX_ALLOC  | Pages: Array of 4K pages
+// < 2MB aligned       |                     |
+//                     |                     |
+// >= 2MB Alignment    | >= PAGES_MAX_ALLOC  | Independent: Individual mappings
 
 heap_alloc :: proc(size: int, alignment: int = size_of(Region_Chunk), zero_memory: bool = true) -> rawptr {
 	if size <= REGION_MAX_ALLOC {
@@ -30,47 +32,41 @@ heap_alloc :: proc(size: int, alignment: int = size_of(Region_Chunk), zero_memor
 	if size < PAGES_MAX_ALLOC {
 		return _pages_alloc(size, alignment, zero_memory)
 	}
-	return _independent_alloc(size, alignment, zero_memory)
+	return _independent_alloc(size, alignment) // no zero_memory
 }
 
 heap_resize :: proc(old_memory: rawptr, new_size: int, new_alignment: int = size_of(Region_Chunk), zero_memory: bool = true) -> rawptr {
 	if old_memory == nil {
 		return heap_alloc(new_size, new_alignment, zero_memory)
 	}
-
-	header: ^Pages_Header
-	if !_is_page_aligned(old_memory) {
-		return _region_resize(old_memory, new_size, new_alignment, zero_memory)
-	} else {
-		header = _pages_get_header(old_memory)
+	if new_size == 0 {
+		heap_free(old_memory)
+		return nil
 	}
 
-	if header == nil {
+	if !mem.page_aligned(old_memory) {
+		return _region_resize(old_memory, new_size, new_alignment, zero_memory)
+	} else if (uintptr(old_memory) & (INDEPENDENT_MIN_ALIGN - 1)) != 0 {
+		return _pages_resize(old_memory, new_size, new_alignment, zero_memory)
+	} else {
 		return _independent_resize(old_memory, new_size, new_alignment, zero_memory)
 	}
-	return _pages_resize(header, old_memory, new_size, new_alignment, zero_memory)
 }
 
 heap_free :: proc(memory: rawptr) {
 	if memory == nil {
 		return
 	}
-
-	header: ^Pages_Header
-	if !_is_page_aligned(memory) {
-		_region_free(memory)
+	if !mem.page_aligned(old_memory) {
+		return _region_free(old_memory)
+	} else if (uintptr(old_memory) & (INDEPENDENT_MIN_ALIGN - 1)) != 0 {
+		return _pages_free(old_memory)
 	} else {
-		header = _pages_get_header(memory)
-	}
-
-	if header == nil {
-		_independent_free(memory)
-	} else {
-		_pages_free(header, memory)
+		return _independent_free(old_memory)
 	}
 }
 
-// impl
+// Region impl
 
 CHUNKS_PER_MAP_CELL   :: size_of(Map_Cell) * 8 / 2
 MAP_CELLS_PER_REGION  :: PAGE_SIZE / size_of(Region_Chunk) / CHUNKS_PER_MAP_CELL
@@ -89,7 +85,7 @@ Region_Header :: struct #align(16) {
 }
 #assert(offset_of(Region_Header, in_use) == 64)
 DEFAULT_REGION_HEADER : Region_Header : {
-	max_align = REGION_MAX_ALIGN / size_of(Region_Chunk)
+	max_align = REGION_MAX_ALIGN / size_of(Region_Chunk),
 }
 
 Region :: struct {
@@ -107,17 +103,13 @@ Cell_State :: enum i8 {
 	Empty,
 	Begin,
 	Data,
-	_,
+	Blocked,
 }
 #assert(int(max(Cell_State)) < 4) // 2 bit state
 
 Map_Cell     :: u64
 Region_Chunk :: [16]u8
 
-// Regions are stored linearly in multiple buffers
-// using the page_allocator that has been configured
-// to not allow the data to move. When we fail to
-// resize, just start a new buffer.
 _region_list      : [dynamic][]Region
 _region_list_mutex: sync.Mutex
 
@@ -127,19 +119,14 @@ REGION_IN_USE :: rawptr(~uintptr(0))
 @thread_local _local_region:     ^Region
 @thread_local _local_list_index: int
 
-_region_aquire_try :: proc(target: rawptr) -> (success: bool) {
-	target := target
-	owner := sync.atomic_compare_exchange_strong_explicit(
-		&target,
-		&_local_region,
-		REGION_IN_USE,
-		.Acquire,
-		.Relaxed,
-	)
+_region_aquire_try :: proc(region: ^Region) -> (success: bool) {
+	target := region.header.local_region_addr
+	owner := sync.atomic_compare_exchange_strong_explicit(&target, &_local_region, REGION_IN_USE, .Acquire, .Relaxed)
 	return owner == &_local_region
 }
 
 _region_release :: proc() {
+	sync.atomic_store_explicit(&_local_region.header.local_region_addr, &_local_region, .Release)
 }
 
 _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
@@ -148,13 +135,22 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 		curr := mem.ptr_sub(_local_region, &list[0])
 		i := (curr + 1) % len(list)
 		for ; i != curr; i = (i + 1) % len(list) {
-			if success = _region_aquire_try(&list[i].header.local_region_addr); !success {
+			if success := _region_aquire_try(&list[i]); !success {
 				continue
 			}
-			if size > (REGION_CHUNK_COUNT - int(list[i].header.map_in_use_end)) ||
+			defer _region_release()
+
+			hdr := &list[i].header
+			if size > (REGION_CHUNK_COUNT - int(hdr.map_in_use_end)) ||
 			   align > int(list[i].header.max_align) {
 				continue
 			}
+
+			offset := _chunk_fit(hdr.chunk_map,
+					     size / size_of(Region_Chunk),
+					     align / size_of(Region_Chunk),
+					     0,
+			)
 
 			/* TODO: Try to FIT IT !!! */
 		}
@@ -170,23 +166,23 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 		defer sync.mutex_unlock(&_region_list_mutex)
 
 		if _region_list == nil {
-			internal_allocator := _page_allocator()
 			err: mem.Allocator_Error
-			_region_list, err = make([dynamic][]Region, 1, PAGE_SIZE / size_of(_region_list[0]), internal_allocator)
+			_region_list, err = make([dynamic][]Region, 1, mem.page_allocator())
 			assert(err == nil)
 
-			external_allocator := _page_allocator({.Unmovable_Pages})
-			_region_list[0], err = make([]Region, 16, external_allocator)
+			@static region_allocator: mem.Page_Allocator
+			mem.page_allocator_init(&region_allocator, {.Static_Pages})
+			_region_list[0], err = make([]Region, 64, mem.page_allocator(&region_allocator))
+			assert(err == nil)
+
 			_region_list[0][0].header = DEFAULT_REGION_HEADER
 		}
 	}
 
 	if _local_region == nil { _local_region = &_region_list[0][0] }
 
-	success := _region_aquire_try(&_local_region.header.local_region_addr)
-	/* TODO: check if space */
-	for ; !success; {
-		// region stolen by another thread; find new one
+	success: bool
+	for !success {
 		success = region_list_find_fit(chunk_size, chunk_align)
 	}
 
@@ -203,35 +199,88 @@ _region_resize :: proc(old_memory: rawptr, size, align: int, zero_memory: bool) 
 _region_free :: proc(old_memory: rawptr) {
 }
 
+// Pages impl
+
 _pages_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 	unimplemented()
 }
 
-_pages_resize :: proc(pages: ^Pages_Header, old_memory: rawptr, new_size, align: int, zero_memory: bool) -> rawptr {
+_pages_resize :: proc(old_memory: rawptr, new_size, align: int, zero_memory: bool) -> rawptr {
 	unimplemented()
 }
 
-_pages_free :: proc(pages: ^Pages_Header, old_memory: rawptr) {
+_pages_free :: proc(old_memory: rawptr) {
 	unimplemented()
 }
 
-_pages_get_header :: proc(memory: rawptr) -> ^Pages_Header {
-	return {}
-}
+// Independent impl
 
-_independent_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
-	unimplemented()
+// The page allocator requires size information to properly unmap pages
+independent_map: map[rawptr]u32
+independent_allocator: mem.Page_Allocator
+
+_independent_alloc :: proc(size, align: int) -> rawptr {
+	// This map could be removed if we just send size to heap_free.
+	if independent_map == nil {
+		mem.page_allocator_init(&independent_page_allocator, {.Allow_Large_Pages})
+		independent_map = make(map[rawptr]u32, 16, mem.page_allocator())
+	}
+
+	ptr, err := mem.page_aligned_alloc(size, align, 0, independent_allocator.flags, &independent_allocator.platform)
+	if err == nil {
+		return nil
+	}
+	aligned_size := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
+	page_count := u32(aligned_size / mem.DEFAULT_PAGE_SIZE)
+	independent_map[ptr] = page_count
+	return ptr
 }
 
 _independent_resize :: proc(old_memory: rawptr, new_size, align: int, zero_memory: bool) -> rawptr {
-	unimplemented()
+	old_size_4k, found := independent_map[old_memory]
+	if !found {
+		return nil
+	}
+
+	flags := independent_page_allocator.flags
+	if zero_memory {
+		flags -= {.Uninitialized_Memory}
+	} else {
+		flags += {.Uninitialized_Memory}
+	}
+
+	old_size := int(old_size_4k * mem.DEFAULT_PAGE_SIZE)
+	if old_size == new_size {
+		return old_memory
+	}
+
+	ptr, err := mem.page_aligned_resize(old_memory,
+					    old_size,
+					    new_size,
+					    align,
+					    flags,
+					    &independent_page_allocator)
+	if err != nil {
+		return nil
+	}
+	if ptr != old_memory {
+		delete_key(&independent_map, old_memory)
+	}
+	aligned_size := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
+	page_count := u32(aligned_size / mem.DEFAULT_PAGE_SIZE)
+	independent_map[ptr] = page_count
 }
 
 _independent_free :: proc(old_memory: rawptr) {
-	unimplemented()
+	size_4k, found := independent_map[old_memory]
+	if !found {
+		return
+	}
+	size := int(size_4k * mem.DEFAULT_PAGE_SIZE)
+	mem.page_free(old_memory, size, {}, &independent_page_allocator)
 }
 
-_chunk_find_fit :: proc(chunk_map: []Map_Cell, map_end: int, size: int, align: int = 1, align_penalty: int = 0) {
+_chunk_fit :: proc(chunk_map: []Map_Cell, size: int, align: int = 1, align_penalty: int = 0) -> int {
 	i := 0
 
 	// align_penalty accounts for user data offset
