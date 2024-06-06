@@ -2,6 +2,7 @@ package heap
 
 import "core:mem"
 import "core:sync"
+import "core:mem/virtual"
 
 // general purpose heap allocator
 
@@ -20,7 +21,7 @@ INDEPENDENT_MIN_ALIGN :: 2 * mem.Megabyte
 // --------------------| --------------------|-----------------
 // < page aligned      | <= REGION_MAX_ALLOC | Region: A 4K page subdivided for small allocations
 //                     |                     |
-// page aligned &&     | <  PAGES_MAX_ALLOC  | Pages: Array of 4K pages
+// page aligned &&     | <  PAGES_MAX_ALLOC  | Pages: Arrays of 4K pages
 // < 2MB aligned       |                     |
 //                     |                     |
 // >= 2MB Alignment    | >= PAGES_MAX_ALLOC  | Independent: Individual mappings
@@ -44,7 +45,7 @@ heap_resize :: proc(old_memory: rawptr, new_size: int, new_alignment: int = size
 		return nil
 	}
 
-	if !mem.page_aligned(old_memory) {
+	if !virtual.page_aligned(old_memory) {
 		return _region_resize(old_memory, new_size, new_alignment, zero_memory)
 	} else if (uintptr(old_memory) & (INDEPENDENT_MIN_ALIGN - 1)) != 0 {
 		return _pages_resize(old_memory, new_size, new_alignment, zero_memory)
@@ -53,16 +54,16 @@ heap_resize :: proc(old_memory: rawptr, new_size: int, new_alignment: int = size
 	}
 }
 
-heap_free :: proc(memory: rawptr) {
+heap_free :: proc(memory: rawptr, size: int = 0) {
 	if memory == nil {
 		return
 	}
-	if !mem.page_aligned(old_memory) {
-		return _region_free(old_memory)
-	} else if (uintptr(old_memory) & (INDEPENDENT_MIN_ALIGN - 1)) != 0 {
-		return _pages_free(old_memory)
+	if !virtual.page_aligned(memory) {
+		_region_free(memory)
+	} else if (uintptr(memory) & (INDEPENDENT_MIN_ALIGN - 1)) != 0 {
+		_pages_free(memory)
 	} else {
-		return _independent_free(old_memory)
+		_independent_free(memory, size)
 	}
 }
 
@@ -129,74 +130,117 @@ _region_release :: proc() {
 	sync.atomic_store_explicit(&_local_region.header.local_region_addr, &_local_region, .Release)
 }
 
-_region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
-	region_list_find_fit :: proc(size, align: int) -> (success: bool) {
-		list := _region_list[_local_list_index]
-		curr := mem.ptr_sub(_local_region, &list[0])
-		i := (curr + 1) % len(list)
-		for ; i != curr; i = (i + 1) % len(list) {
-			if success := _region_aquire_try(&list[i]); !success {
-				continue
-			}
-			defer _region_release()
+_region_list_find_fit :: proc(size, align: int) -> (ptr: rawptr, success: bool) {
+	list := _region_list[_local_list_index]
+	curr := int(uintptr(_local_region) - uintptr(&list[0])) / size_of(Region)
 
-			hdr := &list[i].header
-			if size > (REGION_CHUNK_COUNT - int(hdr.map_in_use_end)) ||
-			   align > int(list[i].header.max_align) {
-				continue
-			}
+	i := curr
+	for {
+		if success := _region_aquire_try(&list[i]); !success {
+			continue
+		}
+		defer _region_release()
 
-			offset := _chunk_fit(hdr.chunk_map,
-					     size / size_of(Region_Chunk),
-					     align / size_of(Region_Chunk),
-					     0,
-			)
-
-			/* TODO: Try to FIT IT !!! */
+		hdr := &list[i].header
+		if size > (REGION_CHUNK_COUNT - int(hdr.map_in_use_end)) ||
+		   align > int(list[i].header.max_align) {
+			continue
 		}
 
-		return /* TODO */
-	}
+		offset := _chunk_fit(hdr.chunk_map[:],
+				     size / size_of(Region_Chunk),
+				     align / size_of(Region_Chunk),
+				     0,
+		)
+		if offset != -1 {
+			return &list[i].chunks[offset], true
+		}
 
+		i = (i + 1) % len(list)
+		if i == curr {
+			break
+		}
+	}
+	return nil, false
+}
+
+_region_size_lookup :: proc(ptr: rawptr) -> int {
+	// TODO
+	return 0
+}
+
+region_allocator: virtual.Page_Allocator
+_region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 	chunk_size  := max(size / size_of(Region_Chunk), 1)
 	chunk_align := max(align / size_of(Region_Chunk), 1)
 
+	// region init
 	if _region_list == nil {
 		sync.mutex_lock(&_region_list_mutex)
 		defer sync.mutex_unlock(&_region_list_mutex)
 
 		if _region_list == nil {
 			err: mem.Allocator_Error
-			_region_list, err = make([dynamic][]Region, 1, mem.page_allocator())
+			_region_list, err = make([dynamic][]Region, virtual.page_allocator())
 			assert(err == nil)
 
-			@static region_allocator: mem.Page_Allocator
-			mem.page_allocator_init(&region_allocator, {.Static_Pages})
-			_region_list[0], err = make([]Region, 64, mem.page_allocator(&region_allocator))
+			virtual.page_allocator_init(&region_allocator, {.Static_Pages})
+			_region_list[0], err = make([]Region, 64, virtual.page_allocator(&region_allocator))
 			assert(err == nil)
 
 			_region_list[0][0].header = DEFAULT_REGION_HEADER
 		}
 	}
 
-	if _local_region == nil { _local_region = &_region_list[0][0] }
+	if _local_region == nil {
+		_local_region = &_region_list[0][0]
+	}
 
-	success: bool
-	for !success {
-		success = region_list_find_fit(chunk_size, chunk_align)
+	curr := _local_list_index
+	for {
+		ptr, success := _region_list_find_fit(chunk_size, chunk_align)
+		if success {
+			return ptr
+		}
+
+		_local_list_index = (_local_list_index + 1) % len(_region_list)
+		if _local_list_index == curr {
+			// TODO: grow region list or make a new one
+			_local_list_index = 0
+		}
 	}
 
 	return nil
 }
 
 _region_resize :: proc(old_memory: rawptr, size, align: int, zero_memory: bool) -> rawptr {
-	//chunk_size  := max(size / size_of(Region_Chunk), 1)
-	//chunk_align := max(align / size_of(Region_Chunk), 1)
+	// TODO: check if we can grow in place
 
-	return nil
+	new_ptr  := _region_alloc(size, align, zero_memory)
+	old_size := _region_size_lookup(old_memory)
+	mem.copy_non_overlapping(new_ptr, old_memory, old_size)
+	_region_free(old_memory)
+	return new_ptr
 }
 
 _region_free :: proc(old_memory: rawptr) {
+	// TODO
+}
+
+_chunk_fit :: proc(chunk_map: []Map_Cell, size: int, align: int = 1, align_penalty: int = 0) -> int {
+	i := 0
+
+	if align > align_penalty {
+
+	}
+
+	stride := max(align / CHUNKS_PER_MAP_CELL, 1)
+	for ; i < len(chunk_map); i += stride {
+
+	}
+
+	// TODO
+	return -1
 }
 
 // Pages impl
@@ -217,23 +261,24 @@ _pages_free :: proc(old_memory: rawptr) {
 
 // The page allocator requires size information to properly unmap pages
 independent_map: map[rawptr]u32
-independent_allocator: mem.Page_Allocator
+independent_lock: sync.Mutex // TODO: use this
+independent_allocator: virtual.Page_Allocator
 
 _independent_alloc :: proc(size, align: int) -> rawptr {
-	// This map could be removed if we just send size to heap_free.
+	// This map could be removed if we always have size
 	if independent_map == nil {
-		mem.page_allocator_init(&independent_page_allocator, {.Allow_Large_Pages})
-		independent_map = make(map[rawptr]u32, 16, mem.page_allocator())
+		independent_map = make(map[rawptr]u32, 16, virtual.page_allocator())
+		virtual.page_allocator_init(&independent_allocator, {.Allow_Large_Pages})
 	}
 
-	ptr, err := mem.page_aligned_alloc(size, align, 0, independent_allocator.flags, &independent_allocator.platform)
+	bytes, err := virtual.page_aligned_alloc(size, align, 0, independent_allocator.flags, &independent_allocator.platform)
 	if err == nil {
 		return nil
 	}
 	aligned_size := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
 	page_count := u32(aligned_size / mem.DEFAULT_PAGE_SIZE)
-	independent_map[ptr] = page_count
-	return ptr
+	independent_map[&bytes[0]] = page_count
+	return &bytes[0]
 }
 
 _independent_resize :: proc(old_memory: rawptr, new_size, align: int, zero_memory: bool) -> rawptr {
@@ -242,54 +287,46 @@ _independent_resize :: proc(old_memory: rawptr, new_size, align: int, zero_memor
 		return nil
 	}
 
-	flags := independent_page_allocator.flags
+	flags := independent_allocator.flags
 	if zero_memory {
 		flags -= {.Uninitialized_Memory}
 	} else {
 		flags += {.Uninitialized_Memory}
 	}
 
-	old_size := int(old_size_4k * mem.DEFAULT_PAGE_SIZE)
+	old_size := int(uint(old_size_4k) * virtual.DEFAULT_PAGE_SIZE)
 	if old_size == new_size {
 		return old_memory
 	}
 
-	ptr, err := mem.page_aligned_resize(old_memory,
-					    old_size,
-					    new_size,
-					    align,
-					    flags,
-					    &independent_page_allocator)
+	bytes, err := virtual.page_aligned_resize(old_memory,
+						  old_size,
+						  new_size,
+						  align,
+						  0,
+						  flags,
+						  &independent_allocator.platform)
 	if err != nil {
 		return nil
 	}
-	if ptr != old_memory {
+	if &bytes[0] != old_memory {
 		delete_key(&independent_map, old_memory)
 	}
-	aligned_size := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
+	aligned_size := mem.align_forward_int(new_size, mem.DEFAULT_PAGE_SIZE)
 	page_count := u32(aligned_size / mem.DEFAULT_PAGE_SIZE)
-	independent_map[ptr] = page_count
+	independent_map[&bytes] = page_count
+	return &bytes[0]
 }
 
-_independent_free :: proc(old_memory: rawptr) {
-	size_4k, found := independent_map[old_memory]
-	if !found {
-		return
+_independent_free :: proc(old_memory: rawptr, size: int = 0) {
+	size := size
+	if size == 0 {
+		if size_4k, found := independent_map[old_memory]; found {
+			size = int(size_4k * mem.DEFAULT_PAGE_SIZE)
+		} else {
+			return
+		}
 	}
-	size := int(size_4k * mem.DEFAULT_PAGE_SIZE)
-	mem.page_free(old_memory, size, {}, &independent_page_allocator)
+	virtual.page_free(old_memory, size, {}, &independent_allocator.platform)
 }
 
-_chunk_fit :: proc(chunk_map: []Map_Cell, size: int, align: int = 1, align_penalty: int = 0) -> int {
-	i := 0
-
-	// align_penalty accounts for user data offset
-	if align > align_penalty {
-
-	}
-
-	stride := max(align / CHUNKS_PER_MAP_CELL, 1)
-	for ; i < len(chunk_map); i += stride {
-
-	}
-}
