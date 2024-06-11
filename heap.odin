@@ -111,10 +111,10 @@ STATE_BLOCKED :: 0x3
 CELL_FILL_MASK_BEGIN :: 0x6aaaaaaaaaaaaaaa
 CELL_FILL_MASK_DATA  :: 0xaaaaaaaaaaaaaaaa
 
-Cell     :: u64
+Cell :: u64
 Region_Chunk :: [16]u8
 
-_region_list      : [dynamic][dynamic]Region
+_region_list: [dynamic][dynamic]Region
 _region_list_mutex: sync.Mutex
 
 REGION_IN_USE :: rawptr(~uintptr(0))
@@ -165,11 +165,6 @@ _region_list_find_fit :: proc(size, align: int) -> (ptr: rawptr, success: bool) 
 	return nil, false
 }
 
-_region_size_lookup :: proc(ptr: rawptr) -> int {
-	// TODO
-	return 0
-}
-
 _region_allocator: virtual.Page_Allocator
 
 _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
@@ -182,13 +177,15 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 		defer sync.mutex_unlock(&_region_list_mutex)
 
 		if _region_list == nil {
+			// TODO: better...
+			@static region_list_allocator: virtual.Page_Allocator
+			virtual.page_allocator_init(&region_list_allocator, {.Never_Free})
+
 			err: mem.Allocator_Error
-			// TODO: Never_Free in the page_allocator would allow us to skip locking the list
-			//       every time we read it.
 			_region_list, err = make([dynamic][dynamic]Region, virtual.page_allocator())
 			assert(err == nil)
 
-			virtual.page_allocator_init(&_region_allocator, {.Static_Pages})
+			virtual.page_allocator_init(&_region_allocator, {.Fixed})
 			_region_list[0], err = make([dynamic]Region, virtual.page_allocator(&_region_allocator))
 			assert(err == nil)
 
@@ -236,10 +233,24 @@ _region_alloc :: proc(size, align: int, zero_memory: bool) -> rawptr {
 }
 
 _region_resize :: proc(old_memory: rawptr, size, align: int, zero_memory: bool) -> rawptr {
-	// TODO: check if we can grow in place
+	region := (^Region)(mem.align_backward(old_memory, mem.DEFAULT_PAGE_SIZE))
+	chunk_idx := uintptr(old_memory) - uintptr(&region.chunks) / size_of(Region_Chunk)
 
-	new_ptr  := _region_alloc(size, align, zero_memory)
-	old_size := _region_size_lookup(old_memory)
+	old_size := _size_lookup(region.header.chunk_map[:], int(chunk_idx))
+	aligned_old_size := mem.align_forward_int(old_size, size_of(Region_Chunk))
+	aligned_size := mem.align_forward_int(size, size_of(Region_Chunk))
+	if aligned_old_size == aligned_size {
+		return old_memory
+	}
+
+	// TODO: if < old_size
+	// TODO: else if >
+
+	end_of_old_memory := int(uintptr(old_memory)) + old_size
+	// TODO: try to grow in place
+
+
+	new_ptr  := heap_alloc(size, align, zero_memory)
 	mem.copy_non_overlapping(new_ptr, old_memory, old_size)
 	_region_free(old_memory)
 	return new_ptr
@@ -249,6 +260,28 @@ _region_free :: proc(old_memory: rawptr) {
 	// TODO
 }
 
+_chunk_idx_to_cell_and_bit :: proc(chunk_idx: int) -> (cell: int, bit: uint) {
+	cell = chunk_idx / CHUNKS_PER_CELL
+	bit  = uint(chunk_idx % CHUNKS_PER_CELL)
+	return
+}
+
+_size_lookup :: proc(chunk_map: []Cell, chunk_idx: int) -> int {
+	cell, bit := _chunk_idx_to_cell_and_bit(chunk_idx)
+
+	assert(chunk_map[cell] >> bit & 0x3 == STATE_BEGIN)
+	i := chunk_idx + 1
+
+	// TODO: this is probably inefficient
+	for ; i < len(chunk_map) * CHUNKS_PER_CELL; i += 1 {
+		cell, bit = _chunk_idx_to_cell_and_bit(i)
+		if chunk_map[cell] >> bit & 0x3 != STATE_DATA {
+			break
+		}
+	}
+	return i - chunk_idx
+}
+
 _chunk_fit :: proc(chunk_map: []Cell, size, stride: int, offset: int = 0) -> int {
 	size := size
 	bit: uint
@@ -256,20 +289,19 @@ _chunk_fit :: proc(chunk_map: []Cell, size, stride: int, offset: int = 0) -> int
 
 	idx := 0
 	search_loop: for ; idx < len(chunk_map) * CHUNKS_PER_CELL; idx += stride {
-		bit  = uint(idx % CHUNKS_PER_CELL)
-		cell = idx / CHUNKS_PER_CELL
-		if ((chunk_map[cell] >> bit) & 0x3) != STATE_EMPTY {
+		cell, bit = _chunk_idx_to_cell_and_bit(idx)
+		if chunk_map[cell] >> bit & 0x3 != STATE_EMPTY {
 			continue
 		}
 		if size == 1 {
 			break
 		}
 
+		// TODO: this is probably inefficient
 		available := 1
 		for i := idx + 1 ; i < len(chunk_map) * CHUNKS_PER_CELL; i += 1 {
-			b := uint(idx % CHUNKS_PER_CELL)
-			c := idx / CHUNKS_PER_CELL
-			if ((chunk_map[c] >> b) & 0x3) != STATE_EMPTY {
+			c, b := _chunk_idx_to_cell_and_bit(idx)
+			if chunk_map[c] >> b & 0x3 != STATE_EMPTY {
 				continue search_loop
 			}
 
@@ -282,7 +314,7 @@ _chunk_fit :: proc(chunk_map: []Cell, size, stride: int, offset: int = 0) -> int
 	if idx >= size_of(chunk_map) * CHUNKS_PER_CELL {
 		return -1
 	}
-	
+
 	// success, populate the map
 	mask := Cell(CELL_FILL_MASK_BEGIN >> bit)
 	for ; size > 0; size -= CHUNKS_PER_CELL {
